@@ -1,19 +1,17 @@
+version: '3.8'
+
 services:
-  wa-decryptor:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: wa-enc-decryptor:latest
-    container_name: wa-decryptor
-    restart: unless-stopped
-    # Muda a porta do HOST para evitar conflito (host:container)
+  whatsapp-decryptor:
+    # Constrói a imagem a partir do Dockerfile no diretório atual
+    build: .
+    # Nome do container para fácil identificação
+    container_name: whatsapp-decryptor-app
+    # Reinicia o container automaticamente em caso de falha
+    restart: always
     ports:
-      - "3011:3000"
+      # Mapeia a porta 8080 da sua máquina/servidor para a porta 3000 do container
+      # Você pode mudar o 8080 para qualquer outra porta que desejar
+      - "8080:3000"
     environment:
-      - NODE_ENV=production
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health"]
-      interval: 30s
-      timeout: 3s
-      retries: 3
-      start_period: 15s
+      # Define a porta que o app Node.js vai usar dentro do container
+      - PORT=3000
