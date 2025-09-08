@@ -1,0 +1,1 @@
+Use .env (HOST_PORT=3011) e acesse http://SEU_HOST:3011/health ou raiz /.
