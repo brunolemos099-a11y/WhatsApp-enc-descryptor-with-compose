@@ -1,92 +1,93 @@
-import express from "express";
-import helmet from "helmet";
-import morgan from "morgan";
-import multer from "multer";
-import bodyParser from "body-parser";
-import cors from "cors";
-import { fetchEncFile, b64ToBuf, guessContentType, normalizeMediaType } from "./utils.js";
-
-let WA_DECRYPT = null;
-async function loadWaDecrypt() {
-  if (WA_DECRYPT) return WA_DECRYPT;
-  const mod = await import("@open-wa/wa-decrypt");
-  WA_DECRYPT =
-    mod?.default?.decryptMedia ||
-    mod?.decryptMedia ||
-    mod?.default ||
-    mod;
-  if (typeof WA_DECRYPT !== "function") {
-    throw new Error("Função decryptMedia não encontrada");
-  }
-  return WA_DECRYPT;
-}
+const express = require('express');
+const crypto = require('crypto');
+const multer = require('multer');
 
 const app = express();
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 64 * 1024 * 1024 } });
+const port = process.env.PORT || 3000; // Usa a porta do ambiente ou 3000 como padrão
 
-app.use(helmet());
-app.use(morgan("tiny"));
-app.use(cors({ origin: "*", methods: ["GET","POST"] }));
-app.use(bodyParser.json({ limit: "10mb" }));
-app.use(bodyParser.urlencoded({ extended: true, limit: "10mb" }));
+// Configuração do Multer para receber o arquivo em memória
+const storage = multer.memoryStorage();
+const upload = multer({ storage: storage });
 
-app.get("/health", (_req,res)=>res.json({ok:true,ts:Date.now()}));
+// Dicionário de "info" strings para HKDF, conforme o tipo de mídia do WhatsApp
+const MEDIA_TYPE_INFO = {
+    'image': 'WhatsApp Image Keys',
+    'audio': 'WhatsApp Audio Keys',
+    'video': 'WhatsApp Video Keys',
+    'document': 'WhatsApp Document Keys',
+    'sticker': 'WhatsApp Image Keys' // Stickers usam a mesma info de imagens
+};
 
-app.get("/decrypt", async (req,res)=>{
-  try {
-    const { url, mediaKey, fileEncSHA256, mediaType, return:ret } = req.query;
-    if (!url || !mediaKey) return res.status(400).json({ error: "url e mediaKey são obrigatórios"});
-    const encBuffer = await fetchEncFile(url);
-    const decryptMedia = await loadWaDecrypt();
-    const type = normalizeMediaType(mediaType);
-    const decBuffer = await decryptMedia(encBuffer, String(mediaKey), type, fileEncSHA256||undefined);
-    if (String(ret).toLowerCase() === "base64") {
-      return res.json({ ok:true, base64: decBuffer.toString("base64"), mime: await guessContentType(decBuffer) });
+/**
+ * Deriva as chaves AES e HMAC a partir da mediaKey principal usando HKDF
+ * @param {Buffer} mediaKeyBuffer - A mediaKey em formato de buffer.
+ * @param {string} mediaType - O tipo de mídia ('image', 'audio', etc.).
+ * @returns {{iv: Buffer, cipherKey: Buffer, macKey: Buffer}}
+ */
+function getDerivedKeys(mediaKeyBuffer, mediaType) {
+    const info = MEDIA_TYPE_INFO[mediaType] || MEDIA_TYPE_INFO['image']; // Default para imagem
+    const hkdf = crypto.hkdfSync('sha256', mediaKeyBuffer, Buffer.alloc(32), Buffer.from(info), 112);
+    
+    return {
+        iv: hkdf.slice(0, 16),
+        cipherKey: hkdf.slice(16, 48),
+        macKey: hkdf.slice(48, 80)
+    };
+}
+
+// Rota principal (GET) para um health check
+app.get('/', (req, res) => {
+    res.status(200).send('Servidor de descriptografia do WhatsApp está online. Use o endpoint POST /decrypt para enviar arquivos.');
+});
+
+// Rota de descriptografia (POST)
+app.post('/decrypt', upload.single('file'), (req, res) => {
+    try {
+        // Validação da requisição
+        if (!req.file) {
+            return res.status(400).json({ error: 'Nenhum arquivo .enc foi enviado.' });
+        }
+        if (!req.body.mediaKey) {
+            return res.status(400).json({ error: 'A mediaKey (em base64) é obrigatória.' });
+        }
+        if (!req.body.mediaType) {
+            return res.status(400).json({ error: 'O mediaType (image, audio, etc.) é obrigatório.' });
+        }
+
+        const encryptedFileBuffer = req.file.buffer;
+        const mediaKey = Buffer.from(req.body.mediaKey, 'base64');
+        const mediaType = req.body.mediaType.toLowerCase();
+
+        // 1. Derivar chaves IV, Cipher e MAC da mediaKey
+        const { iv, cipherKey, macKey } = getDerivedKeys(mediaKey, mediaType);
+
+        // 2. Separar o arquivo em conteúdo e assinatura HMAC
+        const fileCiphertext = encryptedFileBuffer.slice(0, -32);
+        const fileMac = encryptedFileBuffer.slice(-32);
+
+        // 3. Validar a assinatura HMAC
+        const hmac = crypto.createHmac('sha256', macKey).update(Buffer.concat([iv, fileCiphertext])).digest();
+
+        if (!hmac.equals(fileMac)) {
+            return res.status(400).json({ error: 'Falha na validação HMAC. A mediaKey está incorreta ou o arquivo está corrompido.' });
+        }
+
+        // 4. Descriptografar o conteúdo
+        const decipher = crypto.createDecipheriv('aes-256-cbc', cipherKey, iv);
+        const decrypted = Buffer.concat([decipher.update(fileCiphertext), decipher.final()]);
+
+        // 5. Enviar o arquivo descriptografado como resposta
+        // Definimos o content-type para que o n8n/navegador saiba que é um arquivo binário
+        res.setHeader('Content-Disposition', 'attachment; filename=decrypted-file');
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.status(200).send(decrypted);
+
+    } catch (error) {
+        console.error('Erro no processo de descriptografia:', error);
+        res.status(500).json({ error: 'Ocorreu um erro interno no servidor.', details: error.message });
     }
-    res.setHeader("Content-Type", await guessContentType(decBuffer));
-    return res.send(decBuffer);
-  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post("/decrypt", upload.single("file"), async (req,res)=>{
-  try {
-    const fields = req.body || {};
-    const type = normalizeMediaType(fields.mediaType);
-    const mediaKey = fields.mediaKey;
-    if (!mediaKey) return res.status(400).json({ error: "mediaKey obrigatório"});
-    let encBuffer=null;
-    if (req.file?.buffer) encBuffer=req.file.buffer;
-    else if (fields.encBase64) encBuffer=b64ToBuf(fields.encBase64);
-    else if (fields.encUrl) encBuffer=await fetchEncFile(fields.encUrl);
-    else return res.status(400).json({ error: "nenhum .enc enviado"});
-    const decryptMedia = await loadWaDecrypt();
-    const decBuffer = await decryptMedia(encBuffer, String(mediaKey), type, fields.fileEncSHA256||undefined);
-    if (String(fields.return).toLowerCase()==="base64") {
-      return res.json({ ok:true, base64: decBuffer.toString("base64"), mime: await guessContentType(decBuffer) });
-    }
-    res.setHeader("Content-Type", await guessContentType(decBuffer));
-    return res.send(decBuffer);
-  } catch(e) { res.status(500).json({ error: e.message }); }
+app.listen(port, () => {
+    console.log(`Servidor rodando na porta ${port}`);
 });
-
-app.post("/decrypt-batch", async (req,res)=>{
-  try {
-    const items = Array.isArray(req.body) ? req.body : [];
-    if (!items.length) return res.status(400).json({ error: "Envie um array de itens" });
-    const decryptMedia = await loadWaDecrypt();
-    const results = await Promise.all(items.map(async (it, idx)=>{
-      try{
-        const type = normalizeMediaType(it.mediaType);
-        let encBuffer = it.encBase64 ? b64ToBuf(it.encBase64) : (it.encUrl ? await fetchEncFile(it.encUrl) : null);
-        if (!encBuffer) throw new Error("Item sem encBase64/encUrl");
-        if (!it.mediaKey) throw new Error("Item sem mediaKey");
-        const decBuffer = await decryptMedia(encBuffer, String(it.mediaKey), type, it.fileEncSHA256||undefined);
-        return { index: idx, ok:true, base64: decBuffer.toString("base64"), mime: await guessContentType(decBuffer) };
-      }catch(err){ return { index: idx, ok:false, error: String(err?.message||err) }; }
-    }));
-    return res.json({ ok:true, results });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-const PORT=process.env.PORT||3000;
-app.listen(PORT, ()=>console.log("wa-enc-decryptor rodando na porta "+PORT));
