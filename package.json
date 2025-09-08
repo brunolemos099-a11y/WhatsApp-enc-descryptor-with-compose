@@ -1,0 +1,15 @@
+{
+  "name": "whatsapp-enc-decryptor",
+  "version": "1.0.0",
+  "description": "HTTP service to decrypt WhatsApp .enc media (image/audio) to binary.",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
