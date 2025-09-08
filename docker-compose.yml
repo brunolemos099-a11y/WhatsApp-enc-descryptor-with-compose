@@ -1,0 +1,19 @@
+services:
+  wa-decryptor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: wa-enc-decryptor:latest
+    container_name: wa-decryptor
+    restart: unless-stopped
+    # Muda a porta do HOST para evitar conflito (host:container)
+    ports:
+      - "3011:3000"
+    environment:
+      - NODE_ENV=production
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
